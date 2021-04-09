@@ -87,7 +87,7 @@ void ADetectorNode::timer_img_callback()
   {
     cv_bridge::CvImage message;
     message.header   = imgHeader;
-    message.encoding = sensor_msgs::image_encodings::TYPE_32FC1;
+    message.encoding = sensor_msgs::image_encodings::TYPE_8UC3;
     message.image    = detectedImage;
 
     img_publisher_->publish(*message.toImageMsg());
