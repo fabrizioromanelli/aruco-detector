@@ -4,7 +4,7 @@
 #include <Eigen/Geometry>
 #include <cv_bridge/cv_bridge.h>
 #include <opencv2/core/core.hpp>
-#include <ORB_SLAM2/System.h>
+#include <ArucoCodeScanner.h>
 #include "rmw/qos_profiles.h"
 #include "geometry_msgs/msg/pose.hpp"
 #include "std_msgs/msg/int32.hpp"
@@ -18,57 +18,65 @@ rmw_qos_profile_t qos_profile = rmw_qos_profile_sensor_data;
 using std::placeholders::_1;
 using namespace std::chrono_literals;
 
-class ORBSLAM2Node : public rclcpp::Node
+// Detector states
+enum eDetectorState{
+    SYSTEM_NOT_READY=-1,
+    NO_IMAGES_YET=0,
+    NOT_INITIALIZED=1,
+    OK=2,
+    LOST=3
+};
+
+class ADetectorNode : public rclcpp::Node
 {
   public:
-    ORBSLAM2Node(ORB_SLAM2::System* pSLAM, ORB_SLAM2::System::eSensor _sensorType)
-    : Node("orbslam2"), mpSLAM(pSLAM), sensorType(_sensorType)
+    ADetectorNode() : Node("aruco-detector")
     {
       auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, qos_profile.depth), qos_profile);
 
-      // Create publishers with 100ms period
-      pose_publisher_  = this->create_publisher<geometry_msgs::msg::Pose>("orbslam2_pose", qos);
-          pose_timer_  = this->create_wall_timer(100ms, std::bind(&ORBSLAM2Node::timer_pose_callback, this));
-      state_publisher_ = this->create_publisher<std_msgs::msg::Int32>("orbslam2_state", qos);
-          state_timer_ = this->create_wall_timer(100ms, std::bind(&ORBSLAM2Node::timer_state_callback, this));
+      // Create publishers with 200ms period
+      img_publisher_   = this->create_publisher<sensor_msgs::msg::Image>("aruco-detector_image", qos);
+          img_timer_   = this->create_wall_timer(200ms, std::bind(&ADetectorNode::timer_img_callback, this));
+      state_publisher_ = this->create_publisher<std_msgs::msg::Int32>("aruco-detector_state", qos);
+          state_timer_ = this->create_wall_timer(200ms, std::bind(&ADetectorNode::timer_state_callback, this));
+
+      arucoTrackerState = eDetectorState::NO_IMAGES_YET;
     }
 
-    void setPose(cv::Mat);
     void setState(signed int);
+    void setImage(cv::Mat);
 
   private:
-    void timer_pose_callback();
+    void timer_img_callback();
     void timer_state_callback();
 
-    ORB_SLAM2::System* mpSLAM;
-    ORB_SLAM2::System::eSensor sensorType;
-    rclcpp::TimerBase::SharedPtr pose_timer_, state_timer_;
-    rclcpp::Publisher<geometry_msgs::msg::Pose>::SharedPtr pose_publisher_;
+    rclcpp::TimerBase::SharedPtr img_timer_, state_timer_;
+    rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr img_publisher_;
     rclcpp::Publisher<std_msgs::msg::Int32>::SharedPtr state_publisher_;
-    cv::Mat orbslam2Pose = cv::Mat::eye(4,4,CV_32F);
-    signed int orbslam2State = ORB_SLAM2::Tracking::eTrackingState::SYSTEM_NOT_READY;
-    std::mutex poseMtx;
+    signed int arucoTrackerState = eDetectorState::SYSTEM_NOT_READY;
+    std::mutex imgMtx;
     std::mutex stateMtx;
+    cv::Mat detectedImage;
 };
 
-void ORBSLAM2Node::setPose(cv::Mat _pose)
-{
-  poseMtx.lock();
-  orbslam2Pose = _pose;
-  poseMtx.unlock();
-}
-
-void ORBSLAM2Node::setState(signed int _state)
+void ADetectorNode::setState(signed int _state)
 {
   stateMtx.lock();
-  orbslam2State = _state;
+  arucoTrackerState = _state;
   stateMtx.unlock();
 }
 
-void ORBSLAM2Node::timer_pose_callback()
+void ADetectorNode::setImage(cv::Mat _inputImg)
 {
-  geometry_msgs::msg::Pose message = geometry_msgs::msg::Pose();
-  poseMtx.lock();
+  imgMtx.lock();
+  detectedImage = _inputImg;
+  imgMtx.unlock();
+}
+
+void ADetectorNode::timer_img_callback()
+{
+  sensor_msgs::msg::Image message = sensor_msgs::msg::Image();
+  imgMtx.lock();
   if (orbslam2Pose.empty())
   {
     orbslam2Pose = cv::Mat::eye(4,4,CV_32F);
@@ -86,20 +94,20 @@ void ORBSLAM2Node::timer_pose_callback()
   orMat(2,0) = orbslam2Pose.at<float>(2,0);
   orMat(2,1) = orbslam2Pose.at<float>(2,1);
   orMat(2,2) = orbslam2Pose.at<float>(2,2);
-  poseMtx.unlock();
+  imgMtx.unlock();
   Eigen::Quaternionf q(orMat);
   message.orientation.x = q.x();
   message.orientation.y = q.y();
   message.orientation.z = q.z();
   message.orientation.w = q.w();
-  pose_publisher_->publish(message);
+  img_publisher_->publish(message);
 }
 
-void ORBSLAM2Node::timer_state_callback()
+void ADetectorNode::timer_state_callback()
 {
   auto message = std_msgs::msg::Int32();
   stateMtx.lock();
-  message.data = orbslam2State;
+  message.data = arucoTrackerState;
   stateMtx.unlock();
   state_publisher_->publish(message);
 }
@@ -107,16 +115,16 @@ void ORBSLAM2Node::timer_state_callback()
 class ImageGrabber
 {
   public:
-    ImageGrabber(ORB_SLAM2::System* pSLAM, std::shared_ptr<ORBSLAM2Node> pORBSLAM2Node) : mpSLAM(pSLAM), mpORBSLAM2Node(pORBSLAM2Node){}
+    ImageGrabber(std::shared_ptr<ADetectorNode> pADetectorNode, ORB_SLAM2::ArucoCodeScanner *_aScanner) : mpADetectorNode(pADetectorNode), aScanner(_aScanner){}
 
-    void GrabRGBD(const sensor_msgs::msg::Image::SharedPtr& msgRGB, const sensor_msgs::msg::Image::SharedPtr& msgD);
-    void GrabStereo(const sensor_msgs::msg::Image::SharedPtr& msgLeft, const sensor_msgs::msg::Image::SharedPtr& msgRight);
+    void GrabRGB(const sensor_msgs::msg::Image::SharedPtr& msgRGB);
 
-    ORB_SLAM2::System* mpSLAM;
-    std::shared_ptr<ORBSLAM2Node> mpORBSLAM2Node;
+  private:
+    std::shared_ptr<ADetectorNode> mpADetectorNode;
+    ORB_SLAM2::ArucoCodeScanner *aScanner;
 };
 
-void ImageGrabber::GrabRGBD(const sensor_msgs::msg::Image::SharedPtr& msgRGB, const sensor_msgs::msg::Image::SharedPtr& msgD)
+void ImageGrabber::GrabRGB(const sensor_msgs::msg::Image::SharedPtr& msgRGB)
 {
   // Copy the ros image message to cv::Mat.
   cv_bridge::CvImageConstPtr cv_ptrRGB;
@@ -129,118 +137,42 @@ void ImageGrabber::GrabRGBD(const sensor_msgs::msg::Image::SharedPtr& msgRGB, co
     return;
   }
 
-  cv_bridge::CvImageConstPtr cv_ptrD;
-  try
-  {
-    cv_ptrD = cv_bridge::toCvShare(msgD);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    return;
-  }
-
   rclcpp::Time Ts = cv_ptrRGB->header.stamp;
-  mpORBSLAM2Node->setPose(mpSLAM->TrackRGBD(cv_ptrRGB->image, cv_ptrD->image, Ts.seconds()));
-  mpORBSLAM2Node->setState(mpSLAM->GetTrackingState());
+  if(aScanner->Detect(cv_ptrRGB->image))
+  {
+    cv::Mat detectedImage;
+    aScanner->getImage(detectedImage);
+    mpADetectorNode->setImage(detectedImage);
+    mpADetectorNode->setState(eDetectorState::OK);
+  }
+  else
+  {
+    mpADetectorNode->setState(eDetectorState::NO_IMAGES_YET);
+  }
 }
 
-void ImageGrabber::GrabStereo(const sensor_msgs::msg::Image::SharedPtr& msgLeft, const sensor_msgs::msg::Image::SharedPtr& msgRight)
-{
-  // Copy the ros image message to cv::Mat.
-  cv_bridge::CvImageConstPtr cv_ptrLeft;
-  try
-  {
-    cv_ptrLeft = cv_bridge::toCvShare(msgLeft);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    return;
-  }
-
-  cv_bridge::CvImageConstPtr cv_ptrRight;
-  try
-  {
-    cv_ptrRight = cv_bridge::toCvShare(msgRight);
-  }
-  catch (cv_bridge::Exception& e)
-  {
-    return;
-  }
-
-  rclcpp::Time Ts = cv_ptrLeft->header.stamp;
-  mpORBSLAM2Node->setPose(mpSLAM->TrackStereo(cv_ptrLeft->image, cv_ptrRight->image, Ts.seconds()));
-  mpORBSLAM2Node->setState(mpSLAM->GetTrackingState());
-}
-
-enum string_code {
-  eStereo,
-  eRGBD,
-  eIRD
-};
-
-string_code hashit (std::string const& inString) {
-  if (inString == "STEREO") return eStereo;
-  if (inString == "RGBD") return eRGBD;
-  if (inString == "IRD") return eIRD;
-  return eStereo;
-}
-
+//
+// Main
+//
 int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
 
-  bool irDepth = false;
-  ORB_SLAM2::System::eSensor sensorType;
-  switch (hashit(argv[3]))
-  {
-    case eStereo:
-      sensorType = ORB_SLAM2::System::STEREO;
-      break;
-    case eIRD:
-      irDepth = true;
-    case eRGBD:
-      sensorType = ORB_SLAM2::System::RGBD;
-      break;
+  ORB_SLAM2::ArucoCodeScanner *arucoCodeScanner = new ORB_SLAM2::ArucoCodeScanner();
+  auto nodePtr = std::make_shared<ADetectorNode>();
 
-      break;
-    default:
-      break;
-  }
+  ImageGrabber igb(nodePtr, arucoCodeScanner);
+  std::string s = "/camera/color/image_raw";
 
-  ORB_SLAM2::System SLAM(argv[1], argv[2], sensorType, true);
-  auto nodePtr = std::make_shared<ORBSLAM2Node>(&SLAM, sensorType);
+  // message_filters::Subscriber<sensor_msgs::msg::Image> stream1_sub(nodePtr.get(), s1, rmw_qos_profile_sensor_data);
+  // message_filters::Subscriber<sensor_msgs::msg::Image> stream2_sub(nodePtr.get(), s2, rmw_qos_profile_sensor_data);
+  // typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::Image> sync_pol;
+  // message_filters::Synchronizer<sync_pol> sync(sync_pol(10), stream1_sub, stream2_sub);
 
-  ImageGrabber igb(&SLAM, nodePtr);
-  std::string s1, s2;
-
-  if (sensorType == ORB_SLAM2::System::RGBD)
-  {
-    if (irDepth)
-    {
-      s1 = "/camera/infra1/image_rect_raw";
-      s2 = "/camera/aligned_depth_to_infra1/image_raw";
-    }
-    else
-    {
-      s1 = "/camera/color/image_raw";
-      s2 = "/camera/aligned_depth_to_color/image_raw";
-    }
-  }
-  else if (sensorType == ORB_SLAM2::System::STEREO)
-  {
-      s1 = "/camera/infra1/image_rect_raw";
-      s2 = "/camera/infra2/image_rect_raw";
-  }
-
-  message_filters::Subscriber<sensor_msgs::msg::Image> stream1_sub(nodePtr.get(), s1, rmw_qos_profile_sensor_data);
-  message_filters::Subscriber<sensor_msgs::msg::Image> stream2_sub(nodePtr.get(), s2, rmw_qos_profile_sensor_data);
-  typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::msg::Image, sensor_msgs::msg::Image> sync_pol;
-  message_filters::Synchronizer<sync_pol> sync(sync_pol(10), stream1_sub, stream2_sub);
-
-  if (sensorType == ORB_SLAM2::System::RGBD)
-    sync.registerCallback(&ImageGrabber::GrabRGBD, &igb);
-  else if (sensorType == ORB_SLAM2::System::STEREO)
-    sync.registerCallback(&ImageGrabber::GrabStereo, &igb);
+  // if (sensorType == ORB_SLAM2::System::RGBD)
+  //   sync.registerCallback(&ImageGrabber::GrabRGBD, &igb);
+  // else if (sensorType == ORB_SLAM2::System::STEREO)
+  //   sync.registerCallback(&ImageGrabber::GrabStereo, &igb);
 
   rclcpp::spin(nodePtr);
   rclcpp::shutdown();
