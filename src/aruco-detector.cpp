@@ -31,9 +31,9 @@ class ADetectorNode : public rclcpp::Node
       auto qos = rclcpp::QoS(rclcpp::QoSInitialization(qos_profile.history, qos_profile.depth), qos_profile);
 
       // Create publishers with 200ms period
-      img_publisher_   = this->create_publisher<sensor_msgs::msg::Image>("arucoDetector_image", qos);
+      img_publisher_   = this->create_publisher<sensor_msgs::msg::Image>("arucoDetector/image", qos);
           img_timer_   = this->create_wall_timer(200ms, std::bind(&ADetectorNode::timer_img_callback, this));
-      state_publisher_ = this->create_publisher<std_msgs::msg::Int32>("arucoDetector_state", qos);
+      state_publisher_ = this->create_publisher<std_msgs::msg::Int32>("arucoDetector/state", qos);
           state_timer_ = this->create_wall_timer(200ms, std::bind(&ADetectorNode::timer_state_callback, this));
 
       // Create subscriber
@@ -138,7 +138,7 @@ int main(int argc, char * argv[])
 {
   rclcpp::init(argc, argv);
 
-  std::string cameraTopic = "/camera/color/image_raw";
+  std::string cameraTopic = "/aruco/color/image_raw";
 
   ORB_SLAM2::ArucoCodeScanner *arucoCodeScanner = new ORB_SLAM2::ArucoCodeScanner();
   auto nodePtr = std::make_shared<ADetectorNode>(cameraTopic, arucoCodeScanner);
